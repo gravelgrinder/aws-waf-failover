@@ -94,29 +94,71 @@ resource "aws_route_table_association" "b" {
 }
 ###############################################################################
 
+
 ###############################################################################
 ### Web Security Group
 ###############################################################################
-resource "aws_security_group" "web" {
+resource "aws_security_group" "lb" {
   name        = "TF-web-sg"
-  description = "Allow inbound web traffic"
+  description = "Allow inbound web traffic to ALB"
   vpc_id      = aws_vpc.main.id
 
   ingress {
-    description      = "TLS from VPC"
+    description      = "HTTP Port from web"
     from_port        = 80
     to_port          = 80
     protocol         = "tcp"
-    cidr_blocks      = [aws_vpc.main.cidr_block]
-    ipv6_cidr_blocks = [aws_vpc.main.ipv6_cidr_block]
+    cidr_blocks      = ["0.0.0.0/0"]
   }
 
   egress {
+    description      = "Outbound allow"
     from_port        = 0
     to_port          = 0
     protocol         = "-1"
     cidr_blocks      = ["0.0.0.0/0"]
-    ipv6_cidr_blocks = ["::/0"]
+  }
+
+  #tags = {
+  #  Name = "allow_tls"
+  #}
+}
+
+resource "aws_security_group" "ec2" {
+  name        = "TF-ec2-sg"
+  description = "Allow traffic from loadbalancer to ec2"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    description      = "HTTP Port from waf2"
+    security_groups  = [aws_security_group.lb.id]
+    from_port        = 80
+    to_port          = 80
+    protocol         = "tcp"
+  }
+
+  #ingress {
+  #  description      = "HTTP Port from waf1"
+  #  security_groups  = [aws_security_group.lb.id]
+  #  from_port        = 80
+  #  to_port          = 80
+  #  protocol         = "tcp"
+  #}
+
+  ingress {
+    description      = "Inbound from Home"
+    from_port        = 80
+    to_port          = 80
+    protocol         = "tcp"
+    cidr_blocks      = ["208.95.71.55/32"]
+  }
+
+  egress {
+    description      = "Outbound allow"
+    from_port        = 0
+    to_port          = 0
+    protocol         = "-1"
+    cidr_blocks      = ["0.0.0.0/0"]
   }
 
   tags = {
@@ -136,7 +178,7 @@ resource "aws_instance" "web" {
   #availability_zone           = "us-east-1"
   associate_public_ip_address = "true"
   key_name                    = "DemoVPC_Key_Pair"
-  vpc_security_group_ids      = ["sg-02c55e1e2370fa1df"]
+  vpc_security_group_ids      = [aws_security_group.ec2.id]
   user_data = <<EOF
 #!/bin/bash
 
@@ -162,7 +204,126 @@ EOF
 }
 ###############################################################################
 
+###############################################################################
+### ALB for WAF1
+###############################################################################
+resource "aws_lb" "waf1" {
+
+  name               = "TF-waf1-lb"
+  internal           = false
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.lb.id]
+  subnets            = [aws_subnet.publicA.id, aws_subnet.publicB.id]
+
+  enable_deletion_protection = false
+
+  #access_logs {
+  #  bucket  = aws_s3_bucket.lb_logs.bucket
+  #  prefix  = "test-lb"
+  #  enabled = true
+  #}
+
+  #tags = {
+  #  Environment = "production"
+  #}
+}
+
+resource "aws_lb_listener" "waf1" {
+  load_balancer_arn = aws_lb.waf1.arn
+  port              = "80"
+  protocol          = "HTTP"
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.waf1.arn
+  }
+}
+
+resource "aws_lb_target_group" "waf1" {
+  name     = "TF-waf1-lb-tg"
+  port     = 80
+  protocol = "HTTP"
+  vpc_id   = aws_vpc.main.id
+}
+
+resource "aws_lb_target_group_attachment" "waf1" {
+  target_group_arn = aws_lb_target_group.waf1.arn
+  target_id        = aws_instance.web.id
+  port             = 80
+}
+###############################################################################
+
+###############################################################################
+### ALB for WAF2
+###############################################################################
+resource "aws_lb" "web" {
+  name               = "TF-web-lb"
+  internal           = false
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.lb.id]
+  subnets            = [aws_subnet.publicA.id, aws_subnet.publicB.id]
+
+  enable_deletion_protection = false
+
+  #access_logs {
+  #  bucket  = aws_s3_bucket.lb_logs.bucket
+  #  prefix  = "test-lb"
+  #  enabled = true
+  #}
+
+  #tags = {
+  #  Environment = "production"
+  #}
+}
+
+resource "aws_lb_listener" "front_end" {
+  load_balancer_arn = aws_lb.web.arn
+  port              = "80"
+  protocol          = "HTTP"
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.web.arn
+  }
+}
+
+resource "aws_lb_target_group" "web" {
+  name     = "TF-web-lb-tg"
+  port     = 80
+  protocol = "HTTP"
+  vpc_id   = aws_vpc.main.id
+}
+
+resource "aws_lb_target_group_attachment" "web" {
+  target_group_arn = aws_lb_target_group.web.arn
+  target_id        = aws_instance.web.id
+  port             = 80
+}
+###############################################################################
+
+###############################################################################
+### Creating the IP Set
+###############################################################################
+resource "aws_wafv2_ip_set" "ipset" {
+  name               = "MyFirstipset"
+  description        = "Example IP set created from Terraform"
+  scope              = "REGIONAL"
+  ip_address_version = "IPV4"
+  addresses          = ["208.95.71.55/32"]
+}
+
+
 output "instances" {
-  value       = "${aws_instance.web.*.private_ip}"
-  description = "PrivateIP address details"
+  value       = "${aws_instance.web.public_ip}"
+  description = "PublicIP address details"
+}
+
+output "loadbalancer" {
+  value       = "${aws_lb.web.dns_name}"
+  description = "Public DNS Endpoint for ALB"
+}
+
+output "lb_tg_group_attachment" {
+  value       = "${aws_lb_target_group_attachment.web.*}"
+  description = "Public DNS Endpoint for ALB"
 }
